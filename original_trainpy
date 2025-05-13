@@ -1,0 +1,358 @@
+import torch
+from torch import nn
+from torchvision.transforms import Compose, Resize, ToTensor, Normalize, InterpolationMode
+from dataset import fscoco_train  # Only import the train dataset
+from utils import setup
+from torch.utils.data import DataLoader, random_split
+from vpt.launch import default_argument_parser
+import numpy as np
+import matplotlib.pyplot as plt
+import torchvision.models as models
+import wandb
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import timm
+from torchvision.transforms import RandomHorizontalFlip, RandomRotation
+# wandb.init(project="vision-stroke-transformer", name="architecture-diagram")
+
+# Constants
+BICUBIC = InterpolationMode.BICUBIC
+torch.cuda.empty_cache()
+
+def pad_vector_data(vector_data, max_len):
+    """Pad vector data to the maximum length within a batch."""
+    padded = torch.zeros((max_len, 3))  # Assuming vector data has shape [seq_len, 3]
+    padded[:vector_data.size(0), :] = vector_data
+    return padded
+
+def custom_collate_fn(batch):
+    sketches, vector_data, captions = zip(*batch)
+    
+    # Stack sketches (they are already the same size)
+    sketches = torch.stack(sketches)
+    
+    # Pad vector data sequences to the maximum length in this batch
+    max_len = max(vd.size(0) for vd in vector_data)
+    vector_data = torch.stack([pad_vector_data(vd, max_len) for vd in vector_data])
+    
+    return sketches, vector_data, captions
+
+class VisionStrokeTransformer(nn.Module):
+    def __init__(self, d_model=512, nhead=8, num_layers=6, dim_feedforward=2048, dropout=0.5, experiment='experiment3', num_classes=501):
+        super(VisionStrokeTransformer, self).__init__()
+
+        # Load a pre-trained ViT model from timm for raster data
+        self.efficientnet = timm.create_model('efficientnet_b0', pretrained=True, num_classes=d_model)
+
+        # Linear projection for vector data
+        self.vector_projection = nn.Linear(3, d_model)  # Assuming vector data is 3D (x, y, pen state)
+        self.dropout = nn.Dropout(p=dropout)
+        # Separate transformer encoders or cross-attention depending on experiment
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
+        self.experiment = experiment
+
+        if self.experiment in ['experiment1', 'experiment3']:
+            self.vector_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)  # Separate self-attention for vector data
+
+        if self.experiment in ['experiment2', 'experiment3']:
+            self.cross_attention_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)  # Cross-attention mechanism
+
+        # Classification head
+        if self.experiment == 'experiment1':
+            self.classification_head = nn.Linear(d_model * 2, num_classes)  # Adjusted for combining raster and vector features
+        else:
+            self.classification_head = nn.Linear(d_model, num_classes)  # For final class prediction
+
+    def forward(self, raster_input, vector_input):
+        # Forward pass through the pre-trained ViT for image features
+        raster_features = self.efficientnet(raster_input)  # Shape: [batch_size, d_model]
+        raster_features = self.dropout(raster_features)
+        # Project vector input features 
+        vector_features = self.vector_projection(vector_input)  # Shape: [batch_size, seq_len, d_model]
+        vector_features = self.dropout(vector_features)
+
+        if self.experiment == 'baseline':
+            # In the baseline, only raster data is used.
+            class_output = self.classification_head(raster_features)
+
+        elif self.experiment == 'experiment1':
+            # Separate self-attention for raster and vector data
+            vector_features = self.vector_transformer(vector_features)  # Shape: [batch_size, seq_len, d_model]
+            combined_features = torch.cat((raster_features, vector_features.mean(dim=1)), dim=1)  # Combine and reduce vector features
+            class_output = self.classification_head(combined_features)
+
+        elif self.experiment == 'experiment2':
+            # Cross-attention after combining raster and vector features
+            combined_input = torch.cat((raster_features.unsqueeze(1), vector_features), dim=1)  # Shape: [batch_size, combined_seq_len, d_model]
+            transformer_output = self.cross_attention_transformer(combined_input)  # Apply cross-attention
+            class_output = self.classification_head(transformer_output[:, 0, :])
+
+        elif self.experiment == 'experiment3':
+            # Combined approach with self-attention + cross-attention
+            raster_features = raster_features.unsqueeze(1)  # [batch_size, 1, d_model]
+            raster_self_attention = raster_features  # Already has self-attention from ViT
+
+            vector_self_attention = self.vector_transformer(vector_features)  # Self-attention on vector data
+            combined_input = torch.cat((raster_self_attention, vector_self_attention), dim=1)  # Combine self-attention outputs
+
+            combined_output = self.cross_attention_transformer(combined_input)  # Apply cross-attention
+            combined_output = self.dropout(combined_output)
+            class_output = self.classification_head(combined_output[:, 0, :])
+
+        return class_output
+
+def calculate_pixel_accuracy(pred_mask, gt_mask):
+    """
+    Calculate pixel accuracy for image segmentation.
+    
+    Args:
+    pred_mask (torch.Tensor): Predicted segmentation mask
+    gt_mask (torch.Tensor): Ground truth segmentation mask
+    
+    Returns:
+    float: Pixel accuracy
+    """
+    # Ensure the masks are on the same device
+    pred_mask = pred_mask.to(gt_mask.device)
+    
+    # Flatten the masks
+    pred_flat = pred_mask.view(-1)
+    gt_flat = gt_mask.view(-1)
+    
+    # Calculate accuracy
+    correct = torch.sum(pred_flat == gt_flat).item()
+    total = pred_flat.size(0)
+    
+    accuracy = correct / total
+    return accuracy
+
+def evaluate_segmentation(model, dataloader, device, criterion):
+    model.eval()
+    total_accuracy = 0.0
+    num_samples = 0
+    
+    with torch.no_grad():
+        for sketches, vector_data, gt_masks in dataloader:
+            sketches = sketches.to(device)
+            vector_data = vector_data.to(device)
+            gt_masks = gt_masks.to(device)
+            
+            # Assuming your model outputs segmentation masks
+            pred_masks = model(sketches, vector_data)
+            
+            # Calculate accuracy for each sample in the batch
+            for pred, gt in zip(pred_masks, gt_masks):
+                accuracy = calculate_pixel_accuracy(pred, gt)
+                total_accuracy += accuracy
+                num_samples += 1
+    
+    avg_accuracy = total_accuracy / num_samples
+    return avg_accuracy
+
+def extract_classes_from_dataset(dataset):
+    classes = set()
+    for _, _, caption in dataset:
+        words = caption.split()  # Split the caption into words
+        classes.update(words)  # Add each word as a potential class
+    return list(classes)
+
+def evaluate_model(model, dataloader, class_to_idx, device, criterion):
+    model.eval()
+    correct_predictions = 0
+    total_samples = 0
+    total_loss = 0.0  # Initialize the total loss
+
+    with torch.no_grad():
+        for sketches, vector_data, captions in dataloader:
+            sketches = sketches.to(device)
+            vector_data = vector_data.to(device)
+            outputs = model(sketches, vector_data)
+
+            labels = []
+            for caption in captions:
+                words = caption.split()
+                label = None
+                for word in words:
+                    if word in class_to_idx:
+                        label = class_to_idx[word]
+                        break
+                labels.append(label)
+
+            labels = torch.tensor(labels).to(device)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()  # Accumulate the loss
+
+            correct_predictions += (outputs.argmax(dim=1) == labels).sum().item()
+            total_samples += labels.size(0)
+
+    accuracy = 100.0 * correct_predictions / total_samples
+    average_loss = total_loss / len(dataloader)  # Calculate average loss over all batches
+    return accuracy, average_loss
+
+def plot_training_progress(epochs, train_accuracies, val_accuracies, model_name):
+    if len(epochs) == 0:
+        print("No epoch data to plot.")
+        return
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(epochs, train_accuracies, label='Training Accuracy')
+    plt.plot(epochs, val_accuracies, label='Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy (%)')
+    plt.title(f'{model_name} Training and Validation Accuracy')
+    plt.legend()
+    plt.grid(True)
+    
+    # Save the figure with a meaningful name
+    plt.savefig(f'{model_name.lower().replace(" ", "_")}_accuracy_vs_epoch.png')
+    plt.show()
+
+def plot_loss(epochs, train_losses, val_losses, model_name):
+    plt.figure(figsize=(10, 5))
+    plt.plot(epochs, train_losses, label='Training Loss')
+    plt.plot(epochs, val_losses, label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title(f'{model_name} Training and Validation Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Save the figure with a meaningful name
+    plt.savefig(f'{model_name.lower().replace(" ", "_")}_training_loss.png')
+    plt.show()
+
+def plot_confusion_matrix(true_labels, pred_labels, class_names, model_name):
+    cm = confusion_matrix(true_labels, pred_labels, labels=class_names)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.title(f'{model_name} Confusion Matrix')
+    
+    # Save the figure with a meaningful name
+    plt.savefig(f'{model_name.lower().replace(" ", "_")}_confusion_matrix.png')
+    plt.close()
+
+def train_model(cfg):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    num_epochs = cfg.SOLVER.TOTAL_EPOCH
+
+    preprocess_no_T = Compose([
+    RandomHorizontalFlip(),
+    RandomRotation(15),
+    Resize((224, 224), interpolation=BICUBIC),
+    ToTensor(),
+    Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+])
+
+    model = VisionStrokeTransformer(d_model=256, nhead=4, num_layers=3, dim_feedforward=1024, experiment='experiment3', num_classes=748).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=cfg.SOLVER.BASE_LR, momentum=cfg.SOLVER.MOMENTUM, weight_decay=cfg.SOLVER.WEIGHT_DECAY)
+    criterion = nn.CrossEntropyLoss()
+
+    # Load and split the dataset into training and validation sets
+    full_dataset = fscoco_train(transform=preprocess_no_T, augment=False)
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+    train_dataloader = DataLoader(train_dataset, batch_size=cfg.DATA.BATCH_SIZE, shuffle=True, num_workers=4, collate_fn=custom_collate_fn)
+    val_dataloader = DataLoader(val_dataset, batch_size=cfg.DATA.BATCH_SIZE, shuffle=False, num_workers=4, collate_fn=custom_collate_fn)
+
+    train_classes = extract_classes_from_dataset(full_dataset)
+    class_to_idx = {class_name: idx for idx, class_name in enumerate(train_classes)}
+    print(class_to_idx)
+    best_accuracy = 0.0
+    train_accuracies = []
+    val_accuracies = []
+    epochs = []
+    train_losses = []
+    val_losses = []
+    best_val_accuracy = 0.0
+    patience = 5
+    no_improvement_epochs = 0
+
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0.0
+        correct_predictions = 0
+        total_samples = 0
+
+        for batch_idx, (sketches, vector_data, captions) in enumerate(train_dataloader):
+            sketches = sketches.to(device)
+            vector_data = vector_data.to(device)
+            outputs = model(sketches, vector_data)
+
+            labels = []
+            for caption in captions:
+                words = caption.split()
+                label = None
+                for word in words:
+                    if word in class_to_idx:
+                        label = class_to_idx[word]
+                        break
+                labels.append(label)
+
+            labels = torch.tensor(labels).to(device)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            correct_predictions += (outputs.argmax(dim=1) == labels).sum().item()
+            total_samples += labels.size(0)
+
+            accuracy = 100.0 * correct_predictions / total_samples
+            print(f'Epoch [{epoch+1}/{num_epochs}], Step [{batch_idx+1}/{len(train_dataloader)}], Loss: {loss.item()}, Accuracy: {accuracy:.2f}%')
+
+        epoch_accuracy = 100.0 * correct_predictions / total_samples
+        train_accuracies.append(epoch_accuracy)
+        train_losses.append(epoch_loss / len(train_dataloader)) 
+        print(f'Epoch [{epoch+1}/{num_epochs}], Average Loss: {epoch_loss/len(train_dataloader):.4f}, Accuracy: {epoch_accuracy:.2f}%')
+
+        # Evaluate on validation set
+        val_accuracy, val_loss = evaluate_model(model, val_dataloader, class_to_idx, device, criterion)
+        val_accuracies.append(val_accuracy)
+        val_losses.append(val_loss)
+        epochs.append(epoch + 1)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_accuracy:.2f}%')
+
+        if val_accuracy > best_accuracy:
+            best_accuracy = val_accuracy
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_accuracy': best_accuracy,
+            }, 'best_checkpoint.pth')
+            print(f"New best model saved with validation accuracy: {best_accuracy:.2f}%")
+        else:
+            no_improvement_epochs += 1
+        if no_improvement_epochs >= patience:
+            print("Early stopping triggered.")
+            break
+
+    # Debugging: Print the lists before plotting
+    print(f"Epochs: {epochs}")
+    print(f"Train Accuracies: {train_accuracies}")
+    print(f"Validation Accuracies: {val_accuracies}")
+
+    # Plot training progress
+    plot_training_progress(epochs, train_accuracies, val_accuracies, "Experiment 3 - Self Attention + cross attention(efficientnet)")
+    plot_loss(epochs, train_losses, val_losses, "Experiment 3 - Self Attention + cross attention(efficientnet)")
+    # You might want to replace y_true, y_pred, and class_names with actual values from your dataset
+    # plot_confusion_matrix(y_true, y_pred, class_names, "Experiment 1 - Self Attention(efficientnet)")
+
+if __name__ == '__main__':
+    # Assuming 'default_argument_parser' is defined in 'vpt.launch'
+    args = default_argument_parser().parse_args()
+    args.config_file = "/media/sl02435/One Touch/swedel/newproj/newproj/Scene-Sketch-Segmentation/vpt/configs/prompt/cub.yaml"  # Use a small config file for testing
+    args.eval_only = False
+    args.num_epochs = 2  # Run for 2 epochs to test functionality
+
+    cfg = setup(args)
+
+    # Train the model and evaluate on validation set
+    train_model(cfg)
+    # wandb.finish()
